@@ -1,0 +1,6 @@
+# Trivy CVE suppressions
+# Format: CVE-ID [expiry-date] # reason
+#
+# Add entries here only with documented justification and an expiry date.
+# Example:
+# CVE-2024-XXXXX 2025-12-31 # No fix available upstream; mitigated by network policy

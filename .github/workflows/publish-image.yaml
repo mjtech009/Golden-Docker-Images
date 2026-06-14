@@ -1,0 +1,301 @@
+name: Golden Images — Build, Scan & Publish
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - 'Node-24/**'
+      - 'Python-3.13/**'
+      - '.github/workflows/publish-image.yaml'
+  pull_request:
+    branches: [main]
+    paths:
+      - 'Node-24/**'
+      - 'Python-3.13/**'
+      - '.github/workflows/publish-image.yaml'
+  workflow_dispatch:
+
+env:
+  REGISTRY: ghcr.io
+
+# ---------------------------------------------------------------------------
+# Image registry — add new golden images here (name and context directory).
+# The detect-changes job derives dockerfile paths automatically.
+# ---------------------------------------------------------------------------
+
+jobs:
+
+  # ── 0. Detect which images changed ────────────────────────────────────────
+  detect-changes:
+    name: Detect changed images
+    runs-on: ubuntu-latest
+    outputs:
+      lint-matrix: ${{ steps.set-matrix.outputs.lint }}
+      build-matrix: ${{ steps.set-matrix.outputs.build }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+
+      - name: Resolve changed images
+        id: set-matrix
+        env:
+          EVENT:    ${{ github.event_name }}
+          BEFORE:   ${{ github.event.before }}
+          BASE_REF: ${{ github.base_ref }}
+          SHA:      ${{ github.sha }}
+        run: |
+          # ── Image registry (parallel arrays) ──────────────────────────────
+          NAMES=(
+            "node-24-alpine"
+            "node-24-alpine-vault"
+            "python-3.13-alpine"
+            "python-3.13-alpine-vault"
+          )
+          CTXS=(
+            "Node-24/Node:24-alpine"
+            "Node-24/Vault/Node:24-alpine-vault"
+            "Python-3.13/Python:3.13-alpine"
+            "Python-3.13/Vault/Python:3.13-alpine-vault"
+          )
+
+          # ── Resolve which files changed ────────────────────────────────────
+          if [ "$EVENT" = "workflow_dispatch" ]; then
+            CHANGED="__ALL__"
+          elif [ "$EVENT" = "pull_request" ]; then
+            git fetch origin "${BASE_REF}"
+            CHANGED=$(git diff --name-only "origin/${BASE_REF}...HEAD")
+          else
+            # push: zero-SHA means first push on a new branch → rebuild all
+            if [ "$BEFORE" = "0000000000000000000000000000000000000000" ]; then
+              CHANGED="__ALL__"
+            else
+              CHANGED=$(git diff --name-only "${BEFORE}" "${SHA}")
+            fi
+          fi
+
+          # Workflow file change → rebuild every image
+          if echo "$CHANGED" | grep -q "^\.github/workflows/"; then
+            CHANGED="__ALL__"
+          fi
+
+          # ── Build JSON matrices ────────────────────────────────────────────
+          LINT="["
+          BUILD="["
+          SEP=""
+          for i in "${!NAMES[@]}"; do
+            NAME="${NAMES[$i]}"
+            CTX="${CTXS[$i]}"
+            if [ "$CHANGED" = "__ALL__" ] || echo "$CHANGED" | grep -q "^${CTX}/"; then
+              LINT="${LINT}${SEP}{\"name\":\"${NAME}\",\"dockerfile\":\"${CTX}/Dockerfile\"}"
+              BUILD="${BUILD}${SEP}{\"name\":\"${NAME}\",\"context\":\"${CTX}\",\"dockerfile\":\"${CTX}/Dockerfile\"}"
+              SEP=","
+            fi
+          done
+          LINT="${LINT}]"
+          BUILD="${BUILD}]"
+
+          echo "lint=${LINT}"   >> "$GITHUB_OUTPUT"
+          echo "build=${BUILD}" >> "$GITHUB_OUTPUT"
+          echo "Lint matrix:  ${LINT}"
+          echo "Build matrix: ${BUILD}"
+
+  # ── 1. Dockerfile quality gate ────────────────────────────────────────────
+  lint-dockerfiles:
+    name: Lint — ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    needs: detect-changes
+    if: ${{ needs.detect-changes.outputs.lint-matrix != '[]' }}
+    permissions:
+      contents: read
+      security-events: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.detect-changes.outputs.lint-matrix) }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Hadolint — ${{ matrix.name }}
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: ${{ matrix.dockerfile }}
+          # GATE: fail pipeline on ERROR-level findings
+          failure-threshold: error
+          format: sarif
+          output-file: hadolint-${{ matrix.name }}.sarif
+          # Acceptable rule suppressions (document reason beside each)
+          ignore: >-
+            DL3018
+
+      - name: Upload Hadolint SARIF → Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: hadolint-${{ matrix.name }}.sarif
+          category: hadolint-${{ matrix.name }}
+
+  # ── 2. Build → Scan → Gate → Publish ──────────────────────────────────────
+  build-scan-push:
+    name: Build/Scan/Push — ${{ matrix.name }}
+    runs-on: ubuntu-latest
+    needs: [detect-changes, lint-dockerfiles]
+    if: >-
+      needs.detect-changes.outputs.build-matrix != '[]' &&
+      needs.lint-dockerfiles.result == 'success'
+    permissions:
+      contents: read
+      packages: write
+      security-events: write
+      id-token: write
+      attestations: write
+    strategy:
+      fail-fast: false
+      matrix:
+        include: ${{ fromJson(needs.detect-changes.outputs.build-matrix) }}
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU (multi-arch)
+        uses: docker/setup-qemu-action@v3
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Log in to GHCR
+        if: github.event_name != 'pull_request'
+        uses: docker/login-action@v3
+        with:
+          registry: ${{ env.REGISTRY }}
+          username: ${{ github.actor }}
+          password: ${{ secrets.GITHUB_TOKEN }}
+
+      - name: Extract image metadata
+        id: meta
+        uses: docker/metadata-action@v5
+        with:
+          images: ${{ env.REGISTRY }}/${{ github.repository_owner }}/golden-docker-images/${{ matrix.name }}
+          tags: |
+            type=sha,prefix=,format=short
+            type=raw,value=latest,enable={{is_default_branch}}
+            type=ref,event=pr,prefix=pr-
+
+      # Build locally (load) first so Trivy can scan before any push
+      - name: Build image locally (scan target)
+        id: build-local
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          load: true
+          tags: scan-target/${{ matrix.name }}:${{ github.sha }}
+          cache-from: type=gha,scope=${{ matrix.name }}
+          cache-to: type=gha,mode=max,scope=${{ matrix.name }}
+
+      # ── Trivy: full report (all severities, informational — never fails) ──
+      - name: Trivy scan — full report
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: scan-target/${{ matrix.name }}:${{ github.sha }}
+          format: table
+          exit-code: '0'
+          severity: CRITICAL,HIGH,MEDIUM,LOW
+          vuln-type: os,library
+          ignore-unfixed: false
+
+      # ── Trivy: SARIF upload → GitHub Security tab ──
+      - name: Trivy scan — SARIF
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: scan-target/${{ matrix.name }}:${{ github.sha }}
+          format: sarif
+          output: trivy-${{ matrix.name }}.sarif
+          severity: CRITICAL,HIGH,MEDIUM,LOW
+          vuln-type: os,library
+          ignore-unfixed: false
+
+      - name: Upload Trivy SARIF → Security tab
+        if: always()
+        uses: github/codeql-action/upload-sarif@v3
+        with:
+          sarif_file: trivy-${{ matrix.name }}.sarif
+          category: trivy-${{ matrix.name }}
+
+      # ── GATE: hard fail on CRITICAL CVEs that have a fix available ──────
+      - name: "GATE: No fixable CRITICAL CVEs"
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: scan-target/${{ matrix.name }}:${{ github.sha }}
+          format: table
+          exit-code: '1'
+          severity: CRITICAL
+          vuln-type: os,library
+          ignore-unfixed: true     # only fail if a patch actually exists
+
+      # ── SBOM (SPDX + CycloneDX) ─────────────────────────────────────────
+      - name: Generate SBOM — SPDX
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: scan-target/${{ matrix.name }}:${{ github.sha }}
+          format: spdx-json
+          output: sbom-${{ matrix.name }}.spdx.json
+
+      - name: Generate SBOM — CycloneDX
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: scan-target/${{ matrix.name }}:${{ github.sha }}
+          format: cyclonedx
+          output: sbom-${{ matrix.name }}.cdx.json
+
+      - name: Upload SBOMs (90-day retention)
+        uses: actions/upload-artifact@v4
+        with:
+          name: sbom-${{ matrix.name }}-${{ github.sha }}
+          path: |
+            sbom-${{ matrix.name }}.spdx.json
+            sbom-${{ matrix.name }}.cdx.json
+          retention-days: 90
+
+      # ── Compliance report (Trivy JSON — machine-readable) ────────────────
+      - name: Generate compliance report (JSON)
+        uses: aquasecurity/trivy-action@v0.36.0
+        with:
+          image-ref: scan-target/${{ matrix.name }}:${{ github.sha }}
+          format: json
+          output: compliance-${{ matrix.name }}.json
+          severity: CRITICAL,HIGH,MEDIUM,LOW
+          vuln-type: os,library
+          ignore-unfixed: false
+
+      - name: Upload compliance report
+        uses: actions/upload-artifact@v4
+        with:
+          name: compliance-${{ matrix.name }}-${{ github.sha }}
+          path: compliance-${{ matrix.name }}.json
+          retention-days: 90
+
+      # ── Push to GHCR (only on non-PR events, after all gates passed) ─────
+      - name: Build and push to GHCR
+        if: github.event_name != 'pull_request'
+        id: push
+        uses: docker/build-push-action@v6
+        with:
+          context: ${{ matrix.context }}
+          file: ${{ matrix.dockerfile }}
+          push: true
+          tags: ${{ steps.meta.outputs.tags }}
+          labels: ${{ steps.meta.outputs.labels }}
+          platforms: linux/amd64,linux/arm64
+          cache-from: type=gha,scope=${{ matrix.name }}
+          sbom: true
+          provenance: mode=max
+
+      # ── Signed build provenance attestation ──────────────────────────────
+      - name: Attest build provenance
+        if: github.event_name != 'pull_request'
+        uses: actions/attest-build-provenance@v1
+        with:
+          subject-name: ${{ env.REGISTRY }}/${{ github.repository_owner }}/golden-docker-images/${{ matrix.name }}
+          subject-digest: ${{ steps.push.outputs.digest }}
+          push-to-registry: true

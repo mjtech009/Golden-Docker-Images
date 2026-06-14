@@ -1,0 +1,24 @@
+# OS
+.DS_Store
+Thumbs.db
+
+# Editor
+.vscode/
+.idea/
+*.swp
+*.swo
+
+# CI / scan artifacts
+*.sarif
+*.spdx.json
+*.cdx.json
+compliance-*.json
+hadolint-*.sarif
+trivy-*.sarif
+sbom-*.json
+
+# Secrets / env
+.env
+.env.*
+*.pem
+*.key

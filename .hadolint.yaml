@@ -1,0 +1,11 @@
+failure-threshold: error
+
+ignore:
+  # DL3018 — alpine apk: no pinned version. Acceptable in golden base images
+  # because versions are locked at build-time via image digest pinning in CI.
+  - DL3018
+
+trustedRegistries:
+  - docker.io
+  - node
+  - ghcr.io
